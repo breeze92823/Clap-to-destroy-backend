@@ -1,11 +1,10 @@
 import { Room, Client, CloseCode } from "colyseus";
 import { WorldState, PlayerState } from "./schema/WorldState.js";
-import { DISTANCE_MAX, GUEST_ID_PREFIX, LEADERBOARD_EVERY_MS, NAME_MAX, PFP_MAX_LEN, RECONNECT_SECONDS, ROOM_MAX_CLIENTS } from "../constants.js";
+import { GUEST_ID_PREFIX, LEADERBOARD_EVERY_MS, NAME_MAX, PFP_MAX_LEN, RECONNECT_SECONDS, ROOM_MAX_CLIENTS } from "../constants.js";
 import { getPlayers, type PlayerDoc } from "../db.js";
 import { sanitizeProgress } from "../sanitize.js";
-import { accrue, rollWedge, spinStateFrom, type SpinState } from "../spin.js";
 import { claimDaily, dailyFields, dailyView, readDaily, rollDaily, type DailyState } from "../daily.js";
-import { applyAvatar, applyLoadout, applyPose } from "../presence.js";
+import { applyAvatar, applyLoadout, applyPose, sanitizeFx } from "../presence.js";
 import { ranksOf, topBoards } from "../leaderboard.js";
 
 function sanitizeName(raw: unknown): string {
@@ -36,12 +35,12 @@ export class WorldRoom extends Room<{ state: WorldState }> {
   // sessionIds whose current identity's save has been read: only these may write. A save sent
   // before the load answered would overwrite the stored progress with a fresh player's defaults.
   private loaded = new Set<string>();
-  // sessionId -> Spin wheel state (spin.ts), set once the session's save has been read. Kept for
-  // guests and serverless sessions too (it then lasts the connection).
-  private spinStates = new Map<string, SpinState>();
   // sessionId -> Daily Reward state (daily.ts), read with the save. Guests and serverless sessions
   // keep theirs here only (like the rest of their progress, it lasts the session).
   private dailies = new Map<string, DailyState>();
+
+  // sessionId -> fx kind -> epoch ms of its last relayed effect (rate limit, see sanitizeFx).
+  private fxLast = new Map<string, Map<string, number>>();
 
   messages = {
     // Debounced push of the client's whole progress. Upserts, so a first save creates the document.
@@ -54,15 +53,12 @@ export class WorldRoom extends Room<{ state: WorldState }> {
       if (!userId) return;
       const players = getPlayers();
       if (!players) return; // Mongo unset/unreachable -- degrade silently
-      // The personal best only ever goes up ($max), so a stale or replayed save can't lower it.
-      const { bestDistance, ...rest } = patch;
       try {
         await players.updateOne(
           { _id: userId },
           {
             // Display name comes from this connection's own PlayerState, not `msg`.
-            $set: { ...rest, username: p.username || "Player", updatedAt: new Date() },
-            ...(bestDistance !== undefined && { $max: { bestDistance } }),
+            $set: { ...patch, username: p.username || "Player", updatedAt: new Date() },
             $setOnInsert: { version: 1 },
           },
           { upsert: true },
@@ -92,34 +88,20 @@ export class WorldRoom extends Room<{ state: WorldState }> {
       if (rollDaily(s)) void this.saveDaily(client.sessionId, s);
       client.send("daily", dailyView(s));
     },
-    // Spin wheel: uses one spin and rolls the prize here, so the client can't choose it. Answers
-    // `spinResult` { ok, id (SPIN_WEDGES id), spins, nextAt, serverTime } or { ok: false, reason }.
-    spin: async (client: Client) => {
-      const s = this.spinStates.get(client.sessionId);
-      if (!s) return client.send("spinResult", { ok: false, reason: "loading" });
-      const now = Date.now();
-      accrue(s, now);
-      if (s.spins < 1) return client.send("spinResult", { ok: false, reason: "none", ...this.spinView(s, now) });
-      s.spins--;
-      accrue(s, now); // dropping below the cap starts the free-spin clock
-      const wedge = rollWedge();
-      client.send("spinResult", { ok: true, id: wedge.id, ...this.spinView(s, now) });
-      await this.saveSpins(client.sessionId, s);
-    },
-    // The sender's race, relayed through the roster so everyone draws them on the distance bar and
-    // podium: { racing, distance (studs this race) }, a few times a second while racing.
-    race: (client: Client, msg: { racing?: unknown; distance?: unknown }) => {
-      const p = this.state.players.get(client.sessionId);
-      if (!p) return;
-      p.racing = msg?.racing === true;
-      const d = msg?.distance;
-      p.distance = p.racing && typeof d === "number" && Number.isFinite(d) ? Math.min(DISTANCE_MAX, Math.max(0, d)) : 0;
-    },
     // Presence (presence.ts): the sender's pose ~10x/s, its equipped gear and its Bloxity look,
     // relayed through the roster so everyone draws them in the world (client remotePlayers.js).
     pose: (client: Client, msg: unknown) => {
       const p = this.state.players.get(client.sessionId);
       if (p) applyPose(p, msg);
+    },
+    // A clap, shockwave or training clap, relayed to everyone else as `fx` { id (sessionId), kind,
+    // x, y, z, yaw, range } so they play the same effects at the sender's spot.
+    fx: (client: Client, msg: unknown) => {
+      if (!this.state.players.has(client.sessionId)) return;
+      let last = this.fxLast.get(client.sessionId);
+      if (!last) this.fxLast.set(client.sessionId, (last = new Map()));
+      const fx = sanitizeFx(msg, last);
+      if (fx) this.broadcast("fx", { id: client.sessionId, ...fx }, { except: client });
     },
     loadout: (client: Client, msg: unknown) => {
       const p = this.state.players.get(client.sessionId);
@@ -148,7 +130,7 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     }, LEADERBOARD_EVERY_MS);
   }
 
-  // `leaderboard` { boards: { rebirths|trophies|energy|playtime: [{ name, value }] }, ranks: { stat: n | null } }.
+  // `leaderboard` { boards: { wins|skill|rebirths|playTime: [{ name, value }] }, ranks: { stat: n | null } }.
   private async sendLeaderboard(client: Client) {
     const userId = this.userIds.get(client.sessionId) ?? "";
     const [boards, ranks] = await Promise.all([topBoards(), ranksOf(userId)]);
@@ -207,27 +189,7 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     this.identified.delete(sessionId);
     this.loaded.delete(sessionId);
     this.dailies.delete(sessionId);
-    this.spinStates.delete(sessionId);
-  }
-
-  private spinView(s: SpinState, now: number) {
-    return { spins: s.spins, nextAt: s.nextAt, serverTime: now };
-  }
-
-  // The spin fields go straight to Mongo (saveProgress never carries them).
-  private async saveSpins(sessionId: string, s: SpinState) {
-    const userId = this.userIds.get(sessionId);
-    const players = getPlayers();
-    if (!userId || !players) return;
-    try {
-      await players.updateOne(
-        { _id: userId },
-        { $set: { spins: s.spins, spinAt: s.nextAt, updatedAt: new Date() }, $setOnInsert: { version: 1 } },
-        { upsert: true },
-      );
-    } catch (err) {
-      console.warn("[WorldRoom] saveSpins failed", err);
-    }
+    this.fxLast.delete(sessionId);
   }
 
   // Stores a session's Daily Reward state. True when stored, or when there is nowhere to store it
@@ -261,7 +223,6 @@ export class WorldRoom extends Room<{ state: WorldState }> {
     if (userId === prev && this.identified.has(client.sessionId)) return;
     this.identified.add(client.sessionId);
     this.loaded.delete(client.sessionId); // no writes until the new identity's save is read
-    this.spinStates.delete(client.sessionId); // nor spins
     p.signedIn = !!userId;
 
     if (userId) {
@@ -310,11 +271,8 @@ export class WorldRoom extends Room<{ state: WorldState }> {
 
     this.loaded.add(client.sessionId);
     const now = Date.now();
-    const spin = spinStateFrom(doc, now);
-    this.spinStates.set(client.sessionId, spin);
     if (!doc) client.send("noProgress", { serverTime: now });
     else client.send("progress", { ...(sanitizeProgress(doc) ?? {}), serverTime: now });
-    client.send("spins", this.spinView(spin, now));
 
     // Daily Reward: today's day unlocks on join (server clock), then the client gets the calendar.
     const daily = readDaily(doc);
