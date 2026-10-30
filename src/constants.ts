@@ -45,9 +45,9 @@ export const COUNT_MAX = 1e9;
 // Daily Reward (client DAILY.days): days in one calendar cycle.
 export const DAILY_DAYS = 7;
 
-// Leaderboards (leaderboard.ts; client plaza.js boards Top Level / Time Played / Wins): the saved
-// doc fields ranked, rows per board and how often the lists are re-read and re-sent.
-export const LEADERBOARD_STATS = ["level", "playTime", "wins"] as const;
+// Leaderboards (leaderboard.ts; client plaza.js boards Top Level / Time Played / Top Skills / Wins): the
+// saved doc fields ranked, rows per board and how often the lists are re-read and re-sent.
+export const LEADERBOARD_STATS = ["level", "playTime", "skill", "wins"] as const;
 export type LeaderboardStat = (typeof LEADERBOARD_STATS)[number];
 export const LEADERBOARD_SIZE = 10;
 export const LEADERBOARD_EVERY_MS = 60 * 1000;

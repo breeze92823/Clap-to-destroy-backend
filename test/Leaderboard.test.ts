@@ -22,7 +22,7 @@ describe("leaderboard", () => {
 
   it("sends the top saved players per stat and the player's own ranks after the load", async () => {
     const seed = [
-      doc("u1", { username: "Ann", level: 3, wins: 500, playTime: 60 }),
+      doc("u1", { username: "Ann", level: 3, wins: 500, playTime: 60, skill: 0 }),
       doc("u2", { username: "Bo", level: 9, wins: 100, playTime: 7200 }),
       ...Array.from({ length: 15 }, (_, i) => doc(`x${i}`, { username: `P${i}`, wins: 1000 + i })),
     ];
@@ -43,7 +43,7 @@ describe("leaderboard", () => {
     assert.deepStrictEqual(got.boards.wins[0], { name: "P14", value: 1014 });
     assert.deepStrictEqual(got.boards.level.map((r: any) => r.name), ["Bo", "Ann"], "players without a score are left out");
     assert.strictEqual(got.boards.playTime[0].name, "Bo");
-    assert.deepStrictEqual(got.ranks, { level: 2, wins: 16, playTime: 2 });
+    assert.deepStrictEqual(got.ranks, { level: 2, wins: 16, playTime: 2, skill: null });
   });
 
   it("gives a player with no save the lists and no ranks", async () => {
@@ -59,6 +59,6 @@ describe("leaderboard", () => {
     fake.release();
     await sleep(200);
     assert.deepStrictEqual(got?.boards.level, [{ name: "Ann", value: 3 }]);
-    assert.deepStrictEqual(got?.ranks, { level: null, wins: null, playTime: null });
+    assert.deepStrictEqual(got?.ranks, { level: null, wins: null, playTime: null, skill: null });
   });
 });
